@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+
 import time
 
 """
@@ -21,70 +22,57 @@ class MLP(torch.nn.Module):
         out1 = self.h0(out0)
         return self.out(out1)
 
-def test():
-    dim_x = 8
-    num_agents = 3
-    dim_b = 8
-    res_out_dim = 16
-    out_dim = 8
 
-    # residual (encoder/compressor)
-    res_net = MLP(dim_x, res_out_dim)
-    # belief
-    belief_net = MLP(dim_x, num_agents * dim_b)
-    # actor - processes residual and beliefs and outputs actions
-    actor_net = MLP(num_agents * dim_b + res_out_dim, out_dim)
+class AgentNet(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim: int = 8,
+        belief_dim: int = 8,
+        res_out_dim: int = 16,
+        out_dim: int = 8,
+        num_agents: int = 1,
+    ):
+        super(AgentNet, self).__init__()
+        self.x_dim = input_dim
+        self.b_dim = belief_dim
+        self.res_out_dim = res_out_dim
+        self.out_dim = out_dim
+        self.num_agents = num_agents
 
-    # sample input vector x
-    x = torch.randn(dim_x)
-    # obtain residual
-    z = res_net(x)
-    # 1st order belief prediction
-    beliefs = belief_net(x)
-    
-    belief_matrix = torch.zeros((num_agents, dim_b))
-    for i in range(num_agents):
-        belief_matrix[i] = beliefs[i * dim_b : (i + 1) * dim_b]
+        # residual (encoder/compressor)
+        self.res_net = MLP(self.x_dim, res_out_dim)
+        # belief
+        self.belief_net = MLP(self.x_dim, self.num_agents * self.b_dim)
+        # actor - processes residual and beliefs and outputs actions
+        self.actor_net = MLP(self.num_agents * self.b_dim + res_out_dim, out_dim)
 
-    print(f"belief_matrix: \n {belief_matrix}")
+    def forward(self, x):
+        # obtain residual
+        z = self.res_net(x)
+        # 1st order belief prediction
+        b = self.belief_net(x)
 
+        B = torch.zeros((self.num_agents, self.b_dim))
+        for i in range(self.num_agents):
+            B[i] = b[i * self.b_dim : (i + 1) * self.b_dim]
 
-def belief_test():
-    # Define the dimensions
-    dim_x = 5  # dimension of vector x
-    dim_b = 10  # dimension of belief vector
-    K = 12  # total number of agents
+        # print(f"belief_matrix: \n {B}")
+        flattened = B.flatten()
+        final = torch.cat((z, flattened))  # concatenate residual and beliefs
+        # print(f"flattened belief_matrix: \n {flattened}")
+        # print(f"flattened shape: \n {flattened.shape}")
 
-    # Initialize the neural network
-    model = MLP(dim_x, K * dim_b)
-
-    # Sample input vector x
-    x = torch.randn(dim_x)
-    print(f"x: \n {x}")
-
-    # Compute the belief matrix B
-    b = torch.randn(dim_b)  # Assuming b is the agent's own belief vector
-    print(f"b: \n {x}")
-
-    belief_matrix = torch.zeros((K, dim_b))
-    print(f"belief_matrix: \n {belief_matrix}")
-
-    output = model(x)
-    print(f"output: \n {output}")
-
-    time.sleep(1)
-    for i in range(K):
-        belief_matrix[i] = b + output[i * dim_b : (i + 1) * dim_b]
-        print(f"belief_matrix: \n {belief_matrix}")
-
-    # Print the belief matrix B
-    print(belief_matrix)
-
-    print(output.shape)
-    assert output.shape == torch.Size([120])
-    print(belief_matrix.shape)
-    assert output.shape == torch.Size([12, 10])
+        return self.actor_net(final)
 
 
 if __name__ == "__main__":
-    test()
+    device = "mps"  # TODO: set to desired device
+    torch.set_default_device(device=device)
+    agent = AgentNet()
+    agent.to(device=device)
+    print(agent)
+    # sample input vector x
+    x = torch.randn(agent.x_dim)
+    # predict
+    pred = agent(x)
+    print(pred)

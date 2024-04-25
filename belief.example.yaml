@@ -1,0 +1,11 @@
+env:
+    num_agents_landmarks: 2
+    max_cycles: 50
+    keyDelay: 1
+model:
+    device: "mps" # default device to allocate model into
+    # input_groups: 8 # number of different kinds of information (i.e self_vel, self_pos, other_agent_pos, ...)
+    belief_dim: # TODO[URGENT]: WHAT ARE THE "REWARD COEFFCIENTS OF THE OTHER AGENTS" THAT THE PAPER IS REFERRING TO? THIS WILL DETERMINE BELIEF VECTOR DIMENSIONS, ETC.
+    res_out_dim: 16 # output dimension of residual network
+    out_dim: 5 # outputs - i.e. stationary, left, right, up, down
+    # num_agents: int = 1, 

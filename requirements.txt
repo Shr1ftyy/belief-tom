@@ -1,3 +1,4 @@
-torch=2.1.2
 loguru
 omegaconf
+marllib
+protobuf==3.20

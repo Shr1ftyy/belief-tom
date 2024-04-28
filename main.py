@@ -1,11 +1,11 @@
 import numpy as np
 import torch
-import cv2
+# import cv2
 import argparse
 from loguru import logger
 from omegaconf import OmegaConf
 
-from pettingzoo.mpe import simple_adversary_v3
+from marllib import marl
 
 import time
 import sys
@@ -122,68 +122,89 @@ if __name__ == "__main__":
     # load config and initialize environment
     config = OmegaConf.load(args.config)
     # Simple Adversary (Physical Deception)
-    env = simple_adversary_v3.env(
-        N=config.env.num_agents_landmarks,
-        max_cycles=config.env.max_cycles,
-        render_mode="rgb_array",
+    env = marl.make_env(
+        environment_name=config.env.environment_name,
+        map_name=config.env.map_name,
     )
-    env.reset()
 
     # see https://pettingzoo.farama.org/environments/mpe/simple_adversary for more info on this
     # TODO: cleanup?
-    good_input_dim = 2 + 2 + (2 + 2) * (config.env.num_agents_landmarks) - 2
-    adversary_input_dim = (2 + 2) * (config.env.num_agents_landmarks) 
+    # good_input_dim = 2 + 2 + (2 + 2) * (env.num_agents-1) - 2
+    # adversary_input_dim = (2 + 2) * (env.num_agents-1) 
     device = config.model.device  # TODO: set to desired device
-    logger.debug(f"setting default device as: {device}")
-    torch.set_default_device(device=device)
+    # logger.debug(f"setting default device as: {device}")
+    # torch.set_default_device(device=device)
 
-    models = {}
-    for a in env.agents:
-        name = str(a)
-        # TODO: "stricter" checking?
-        input_dim = adversary_input_dim if "adversary" in name else good_input_dim
-        # TODO: which agents are we predicting beliefs for when performing 2nd order belief prediction? -> this will affect the num_agents parameter
-        # for now, we assume that is for all agents for both good agents and the adversary.
-        model = AgentNet(device=device, input_dim=input_dim, belief_dim=input_dim, res_out_dim=config.model.res_out_dim, out_dim=config.model.out_dim, num_agents=env.num_agents)
-        models[name] = model
-        models[name].to(device=device)
-        logger.debug(f"----==== {name} ====----")
-        logger.debug("----==== Architecture ====----")
-        logger.debug(model)
+    # initialize algorithm with appointed hyper-parameters
+    mappo = marl.algos.mappo(hyperparam_source="mpe")
+    # build agent model based on env + algorithms + user preference
+    model = marl.build_model(env, mappo, {"core_arch": "mlp", "encode_layer": "128-256"})
+    mappo.fit(env, model, local_mode=True, stop={"timesteps_total": 10000000}, checkpoint_freq=100, share_policy="group", num_gpus=0, num_workers=4)
+
+    
+'''
+Notes for tracking - rewrite
+TODO: Read and implement https://github.com/Replicable-MARL/MARLlib/blob/rllib_1.8.0_dev/examples/add_new_algorithm.py
+for our use case
+
+Key things to note for implementation
+ - 4 models per agent
+ - 
+'''
 
 
-    prev_obs = {}
-    for agent in env.agent_iter():
-        key = cv2.waitKey(config.env.keyDelay) & 0xFF  # Wait for a key press for 100 milliseconds
-        observation, reward, termination, truncation, info = env.last()
-        assert(observation.shape[0] == models[str(agent)].x_dim)
 
-        if termination or truncation:
-            action = None
-        else:
-            # TODO: use policy
-            action_space = env.action_space(agent)
-            policy = models[str(agent)]
-            obs = torch.Tensor(observation).view(1, -1)
-            logger.trace(f"obs: {obs}")
-            outs = policy(obs)
-            action = torch.argmax(outs).item()
 
-        env.step(action)
-        rdr = env.render()
+    # start training
+    # mappo.fit(env, model, stop={"timesteps_total": 1000000}, checkpoint_freq=100, share_policy="group")
 
-        screen = cv2.cvtColor(rdr, cv2.COLOR_BGR2RGB)
-        cv2.imshow("i believe", screen)
-        # Check if the 'q' key is pressed
-        if key == ord("q"):
-            break  # Break the loop if 'q' is pressed
-        elif key == ord("s"):
-           cv2.imwrite("preview.png", screen)
+    # models = {}
+    # for a in env.agents:
+    #     name = str(a)
+    #     # TODO: "stricter" checking?
+    #     input_dim = adversary_input_dim if "adversary" in name else good_input_dim
+    #     # TODO: which agents are we predicting beliefs for when performing 2nd order belief prediction? -> this will affect the num_agents parameter
+    #     # for now, we assume that is for all agents for both good agents and the adversary.
+    #     model = AgentNet(device=device, input_dim=input_dim, belief_dim=input_dim, res_out_dim=config.model.res_out_dim, out_dim=config.model.out_dim, num_agents=env.num_agents)
+    #     models[name] = model
+    #     models[name].to(device=device)
+    #     logger.debug(f"----==== {name} ====----")
+    #     logger.debug("----==== Architecture ====----")
+    #     logger.debug(model)
 
-        prev_obs[str(agent)] = observation
 
-    cv2.destroyAllWindows()
-    env.close()
+    # prev_obs = {}
+    # for agent in env.agent_iter():
+    #     key = cv2.waitKey(config.env.keyDelay) & 0xFF  # Wait for a key press for 100 milliseconds
+    #     observation, reward, termination, truncation, info = env.last()
+    #     assert(observation.shape[0] == models[str(agent)].x_dim)
+
+    #     if termination or truncation:
+    #         action = None
+    #     else:
+    #         # TODO: use policy
+    #         action_space = env.action_space(agent)
+    #         policy = models[str(agent)]
+    #         obs = torch.Tensor(observation).view(1, -1)
+    #         logger.trace(f"obs: {obs}")
+    #         outs = policy(obs)
+    #         action = torch.argmax(outs).item()
+
+    #     env.step(action)
+    #     rdr = env.render()
+
+    #     screen = cv2.cvtColor(rdr, cv2.COLOR_BGR2RGB)
+    #     cv2.imshow("i believe", screen)
+    #     # Check if the 'q' key is pressed
+    #     if key == ord("q"):
+    #         break  # Break the loop if 'q' is pressed
+    #     elif key == ord("s"):
+    #        cv2.imwrite("preview.png", screen)
+
+    #     prev_obs[str(agent)] = observation
+
+    # cv2.destroyAllWindows()
+    # env.close()
 
 '''
 Just here for personal reference - Syeam

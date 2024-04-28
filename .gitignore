@@ -1,2 +1,4 @@
+.DS_Store
+*exp_results*
 belief.yaml
 .vscode

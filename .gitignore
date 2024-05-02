@@ -2,3 +2,4 @@
 *exp_results*
 belief.yaml
 .vscode
+*__pycache__*

@@ -1,5 +1,5 @@
 .DS_Store
-*exp_results*
+*_results*
 belief.yaml
 .vscode
 *__pycache__*

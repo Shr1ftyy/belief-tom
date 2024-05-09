@@ -19,7 +19,6 @@ import numpy as np
 
 torch, nn = try_import_torch()
 
-
 class ToMModel(CentralizedCriticMLP):
     """The policy architecture"""
 
@@ -27,9 +26,6 @@ class ToMModel(CentralizedCriticMLP):
         super(ToMModel, self).__init__(
             obs_space, action_space, num_outputs, model_config, name
         )
-
-        # TODO: refactor into this style?
-        self.custom_model_config = model_config["custom_model_config"]
 
         in_size = int(np.product(obs_space.shape))
 
@@ -41,43 +37,62 @@ class ToMModel(CentralizedCriticMLP):
         # )
         # residual network is self.encoder created by `BaseMLP`
 
+        # variational network - the network q_theta(z|b) that approximates the conditional
+        # distribution p_sigma(z|b) (see paper for more technical info on this)
+        # But it's basically used as a way to ensure that the belief and residual vectors
+        # do NOT convey the same information
+        self.variational_net = SlimFC(
+            in_size=self.custom_config["num_agents"] * self.custom_config["belief_dim"],
+            out_size=self.custom_config["res_out_dim"],
+            # TODO: should we set initializer=norm_c_initializer(SMTHG_ELSE)? what are it's benefits & drawbacks?
+            initializer=normc_initializer(0.01),
+            activation_fn=self.custom_config["activation"],
+        )
+
         # belief predictor
         self.belief_net = SlimFC(
             in_size=in_size,
-            out_size=self.custom_model_config["num_agents"]
-            * self.custom_model_config["belief_dim"],
+            out_size=self.custom_config["num_agents"]
+            * self.custom_config["belief_dim"],
             # TODO: should we set initializer=norm_c_initializer(SMTHG_ELSE)? what are it's benefits & drawbacks?
             initializer=normc_initializer(0.01),
-            activation_fn=self.custom_model_config["activation"],
+            activation_fn=self.custom_config["activation"],
         )
 
         # actor
         self.actor_net = SlimFC(
-            in_size=self.custom_model_config["num_agents"]
-            * self.custom_model_config["belief_dim"]
-            + self.custom_model_config["res_out_dim"],
+            in_size=self.custom_config["num_agents"]
+            * self.custom_config["belief_dim"]
+            + self.custom_config["res_out_dim"],
             out_size=num_outputs,
             initializer=normc_initializer(0.01),
-            activation_fn=self.custom_model_config["activation"],
+            activation_fn=self.custom_config["activation"],
         )
 
     def forward(
         self, input_dict: Dict[str, Any], state: List[Any], seq_lens: Any
     ) -> (TensorType, List[TensorType]):  # type: ignore
-        # TODO: fix the ignoring above
         # obtain residual
         x = input_dict["obs"]["obs"].float()
         self.inputs = x
-        z = self.p_encoder(x)
+        self.residual = self.p_encoder(x)
         # belief prediction
-        b = self.belief_net(x)
+        self.beliefs = self.belief_net(x)
         # concatenate residual and beliefs
-        final = torch.cat((z, b), dim=1)
+        final = torch.cat((self.residual, self.beliefs), dim=1)
 
         # TODO: should this be the final output or the residual?
-        self._features = z
+        self._features = self.residual
 
         return self.actor_net(final), []
+
+    def get_beliefs(self):
+        assert self.beliefs is not None, "must call forward() first"
+        return self.beliefs
+
+    def get_residual(self):
+        assert self.residual is not None, "must call forward() first"
+        return self.residual
 
 
 # if __name__ == "__main__":

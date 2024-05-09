@@ -4,8 +4,13 @@ Add new algorithm to marllib - with custom policy architecture
 
 # import argparse
 # import os
+import threading
+import time
+from typing import List, Union
+import torch
 
 import ray
+from ray.rllib.utils import force_list, NullContextManager
 import torch.nn.functional as F
 from ray import tune
 from ray.tune import CLIReporter
@@ -14,6 +19,24 @@ from ray.rllib.agents.trainer_template import build_trainer
 from ray.rllib.policy.policy_template import build_policy_class
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.models import ModelCatalog
+from ray.rllib.utils.typing import TrainerConfigDict
+from ray.rllib.evaluation.worker_set import WorkerSet
+from ray.util.iter import LocalIterator
+from ray.rllib.execution.rollout_ops import (
+    ParallelRollouts,
+    ConcatBatches,
+    StandardizeFields,
+    SelectExperiences,
+)
+from ray.rllib.execution.train_ops import TrainOneStep, MultiGPUTrainOneStep
+from ray.rllib.execution.metric_ops import StandardMetricsReporting
+from ray.rllib.agents.ppo.ppo import UpdateKL, warn_about_bad_reward_scales
+from ray.rllib.utils.typing import ModelGradients
+from ray.rllib.policy.rnn_sequencing import pad_batch_to_sequences_of_same_size
+from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
+from ray.rllib.utils.framework import try_import_torch
+from ray.rllib.agents.ppo.ppo import PPOTrainer, DEFAULT_CONFIG as PPO_CONFIG
+
 
 from marllib.marl.algos.core.CC.mappo import (
     MAPPOTorchPolicy,
@@ -31,57 +54,47 @@ from marllib import marl
 import json
 from model import ToMModel
 
-# parser = argparse.ArgumentParser()
-# parser.add_argument("--stop-iters", type=int, default=200)
-# parser.add_argument("--num-cpus", type=int, default=0)
+torch, nn = try_import_torch()
 
-# def mutual_information_loss(policy, model, train_batch):
-#     belief = model.belief_network(train_batch[SampleBatch.CUR_OBS].float())
-#     residual = model.residual_network(train_batch[SampleBatch.CUR_OBS].float())
+# TODO: is there a cleaner way to do this?
+TOMAPPO_CONFIG = PPO_CONFIG
+TOMAPPO_CONFIG['model']['fcnet_activation'] = 'relu'
 
-#     # Compute belief and residual distributions
-#     belief_dist = policy.belief_distribution(belief)
-#     residual_dist = policy.residual_distribution(residual)
+# Variational loss L_q
+def L_q(b, z, variational_net):
+    q_z_given_b = variational_net(b)
+    log_q_z_given_b = -nn.functional.mse_loss(q_z_given_b, z, reduction='none')
+    return -log_q_z_given_b.mean()
 
-#     # Compute the joint distribution P(B, Z)
-#     joint_dist = belief_dist.unsqueeze(1) * residual_dist.unsqueeze(0)
-
-#     # Compute the product of marginal distributions P(B) * P(Z)
-#     marginal_belief = belief_dist.unsqueeze(1).sum(dim=0)
-#     marginal_residual = residual_dist.unsqueeze(0).sum(dim=0)
-#     product_marginals = marginal_belief.unsqueeze(1) * marginal_residual.unsqueeze(0)
-
-#     # Compute KL-divergence between the joint distribution and product of marginals
-#     kl_divergence = F.kl_div(joint_dist.log(), product_marginals, reduction='batchmean')
-
-#     return kl_divergence
-
-# def variational_loss(policy, model, train_batch):
-#     belief = model.belief_network(train_batch[SampleBatch.CUR_OBS].float())
-#     residual = model.residual_network(train_batch[SampleBatch.CUR_OBS].float())
-
-#     # Compute log likelihood of residual given belief
-#     log_likelihood_belief_residual = model.residual_network(belief, train_batch[SampleBatch.CUR_OBS].float()).log_prob(residual)
-#     # Compute log likelihood of residual given sampled beliefs
-#     log_likelihood_residual = model.residual_network(belief.unsqueeze(0), train_batch[SampleBatch.CUR_OBS].float()).log_prob(residual.unsqueeze(0)).mean(dim=0)
-
-#     # Compute contrastive log-ratio upper bound loss
-#     loss_q = -log_likelihood_belief_residual
-#     loss_residual = log_likelihood_belief_residual - log_likelihood_residual
-
-#     return loss_q, loss_residual
-
+# Residual loss L_residual
+def L_residual(b, z, variational_net):
+    joint_log_prob = torch.log(variational_net(b) + 1e-8).mean()
+    marginal_b_log_prob = torch.log(variational_net(b).mean(0, keepdim=True) + 1e-8).mean()
+    marginal_z_log_prob = torch.log(z.mean(0, keepdim=True) + 1e-8).mean()
+    
+    loss_residual = joint_log_prob - (marginal_b_log_prob + marginal_z_log_prob)
+    return loss_residual
 
 def tom_policy_loss(policy, model, dist_class, train_batch):
     ppo_loss = central_critic_ppo_loss(policy, model, dist_class, train_batch)
-    belief_loss = 0  # TODO: belief loss
-    # residual_loss, _ = TODO: residual loss ... variational_loss(policy, model, train_batch)
-    residual_loss = 0
+    # TODO (IMMEDIATE): figure out how to do grad update on belief network with belief loss
+    # belief_loss = F.mse_loss(model.get_beliefs(), train_batch["rewards"])  # TODO: belief loss
+    belief_loss = 0
+    # TODO: are the residual loss and variational loss define correctly?
+    # NOTE: below I assume that beliefs, residuals, etc, have already been generated after ppo_loss() 
+    # initiates a forward pass through the networks, otherwise we should do some forward passes again
+    # for each network we're obtaining losses for
+    residual_loss = L_residual(model.get_beliefs(), model.get_residual(), model.variational_net)
+    variational_loss = L_q(model.get_beliefs(), model.get_residual(), model.variational_net)
+    # residual_loss = 0
     total_loss = (
-        policy.config["custom_model_config"]["alpha"] * ppo_loss
-        + policy.config["custom_model_config"]["beta"] * belief_loss
-        + policy.config["custom_model_config_"]["gamma"] * residual_loss
+        policy.config["model"]["custom_model_config"]["alpha"] * ppo_loss
+        + policy.config["model"]["custom_model_config"]["beta"] * belief_loss
+        + policy.config["model"]["custom_model_config"]["gamma"] * residual_loss
     )
+
+    # TODO (IMMEDIATE): look at claude suggestion and apply it :)
+    # return total_loss, belief_loss, residual_loss, variational_loss
     return total_loss
 
 
@@ -155,15 +168,181 @@ def run_tommappo(model_class, config_dict, common_config, env_dict, stop, restor
     return results
 
 
+def custom_multi_gpu_parallel_grad_calc(self, sample_batches):
+    """A modified version of ray.rllib.policy.TorchPolicy._multi_gpu_parallel_grad_calc created to support
+    to seperate the training of the belief and variational network from the rest of the policy
+    """
+
+    assert len(self.model_gpu_towers) == len(sample_batches)
+    lock = threading.Lock()
+    results = {}
+    grad_enabled = torch.is_grad_enabled()
+
+    def _worker(shard_idx, model, sample_batch, device):
+        torch.set_grad_enabled(grad_enabled)
+        try:
+            with NullContextManager(
+            ) if device.type == "cpu" else torch.cuda.device(device):
+                loss_out = force_list(
+                    self._loss(self, model, self.dist_class, sample_batch))
+
+                # Call Model's custom-loss with Policy loss outputs and
+                # train_batch.
+                loss_out = model.custom_loss(loss_out, sample_batch)
+
+                assert len(loss_out) == len(self._optimizers)
+
+                # Loop through all optimizers.
+                grad_info = {"allreduce_latency": 0.0}
+
+                parameters = list(model.parameters())
+                all_grads = [None for _ in range(len(parameters))]
+                for opt_idx, opt in enumerate(self._optimizers):
+                    # Erase gradients in all vars of the tower that this
+                    # optimizer would affect.
+                    param_indices = self.multi_gpu_param_groups[opt_idx]
+                    for param_idx, param in enumerate(parameters):
+                        if param_idx in param_indices and \
+                                param.grad is not None:
+                            param.grad.data.zero_()
+                    # Recompute gradients of loss over all variables.
+                    loss_out[opt_idx].backward(retain_graph=True)
+                    grad_info.update(
+                        self.extra_grad_process(opt, loss_out[opt_idx]))
+
+                    grads = []
+                    # Note that return values are just references;
+                    # Calling zero_grad would modify the values.
+                    for param_idx, param in enumerate(parameters):
+                        if param_idx in param_indices:
+                            if param.grad is not None:
+                                grads.append(param.grad)
+                            all_grads[param_idx] = param.grad
+
+                    if self.distributed_world_size:
+                        start = time.time()
+                        if torch.cuda.is_available():
+                            # Sadly, allreduce_coalesced does not work with
+                            # CUDA yet.
+                            for g in grads:
+                                torch.distributed.all_reduce(
+                                    g, op=torch.distributed.ReduceOp.SUM)
+                        else:
+                            torch.distributed.all_reduce_coalesced(
+                                grads, op=torch.distributed.ReduceOp.SUM)
+
+                        for param_group in opt.param_groups:
+                            for p in param_group["params"]:
+                                if p.grad is not None:
+                                    p.grad /= self.distributed_world_size
+
+                        grad_info[
+                            "allreduce_latency"] += time.time() - start
+
+            with lock:
+                results[shard_idx] = (all_grads, grad_info)
+        except Exception as e:
+            with lock:
+                results[shard_idx] = (ValueError(
+                    e.args[0] + "\n" +
+                    "In tower {} on device {}".format(shard_idx, device)),
+                                        e)
+
+    # Single device (GPU) or fake-GPU case (serialize for better
+    # debugging).
+    if len(self.devices) == 1 or self.config["_fake_gpus"]:
+        for shard_idx, (model, sample_batch, device) in enumerate(
+                zip(self.model_gpu_towers, sample_batches, self.devices)):
+            _worker(shard_idx, model, sample_batch, device)
+            # Raise errors right away for better debugging.
+            last_result = results[len(results) - 1]
+            if isinstance(last_result[0], ValueError):
+                raise last_result[0] from last_result[1]
+    # Multi device (GPU) case: Parallelize via threads.
+    else:
+        threads = [
+            threading.Thread(
+                target=_worker,
+                args=(shard_idx, model, sample_batch, device))
+            for shard_idx, (model, sample_batch, device) in enumerate(
+                zip(self.model_gpu_towers, sample_batches, self.devices))
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    # Gather all threads' outputs and return.
+    outputs = []
+    for shard_idx in range(len(sample_batches)):
+        output = results[shard_idx]
+        if isinstance(output[0], Exception):
+            raise output[0] from output[1]
+        outputs.append(results[shard_idx])
+    return outputs 
+
+# TODO: update this
+def optimizer(
+        self, config
+) -> Union[List["torch.optim.Optimizer"], "torch.optim.Optimizer"]: # type: ignore
+    """Customizes the pytorch optimizers to be used by params
+
+    Returns:
+        Union[List[torch.optim.Optimizer], torch.optim.Optimizer]:
+            The local PyTorch optimizer(s) to use for this Policy.
+    """
+    params = filter(lambda p: p.requires_grad, self.model.parameters())
+    if config is not None:
+        return torch.optim.Adam(params, lr=config["lr"])
+    else:
+        return torch.optim.Adam(params)
+
+def compute_gradients(self, postprocessed_batch: SampleBatch) -> ModelGradients:
+
+    assert len(self.devices) == 1
+
+    # If not done yet, see whether we have to zero-pad this batch.
+    if not postprocessed_batch.zero_padded:
+        pad_batch_to_sequences_of_same_size(
+            batch=postprocessed_batch,
+            max_seq_len=self.max_seq_len,
+            shuffle=False,
+            batch_divisibility_req=self.batch_divisibility_req,
+            view_requirements=self.view_requirements,
+        )
+
+    postprocessed_batch.is_training = True
+    self._lazy_tensor_dict(postprocessed_batch, device=self.devices[0])
+
+    # # Freeze the belief network - is this what I should do?
+    # self.model.belief_net.requires_grad = False
+
+    # Do the (maybe parallelized) gradient calculation step.
+    tower_outputs = self._multi_gpu_parallel_grad_calc([postprocessed_batch])
+
+    all_grads, grad_info = tower_outputs[0]
+
+    grad_info["allreduce_latency"] /= len(self._optimizers)
+    grad_info.update(self.extra_grad_info(postprocessed_batch))
+
+    fetches = self.extra_compute_grad_fetches()
+
+    return all_grads, dict(fetches, **{LEARNER_STATS_KEY: grad_info})
+
+
 def get_policy_class_tomappo(config_):
     if config_["framework"] == "torch":
-        return MAPPOTorchPolicy
+        return ToMMAPPOPolicy
 
 
 # <class 'ray.rllib.policy.torch_policy_template.MyTorchPolicy'>
 ToMMAPPOPolicy = MAPPOTorchPolicy.with_updates(
     name="ToMMAPPOPolicy",
+    get_default_config=lambda: TOMAPPO_CONFIG, 
+    optimizer_fn=optimizer,
     loss_fn=tom_policy_loss,
+    compute_gradients_fn=compute_gradients,
 )
 
 # <class 'ray.rllib.agents.trainer_template.MyCustomTrainer'>
@@ -191,7 +370,7 @@ if __name__ == "__main__":
 
     tommappo = marl.algos.tommappo(hyperparam_source="common")
 
-    model = marl.build_model(env, tommappo, {"core_arch": "mlp"})
+    # model = marl.build_model(env, tommappo, {"core_arch": "mlp"})
     # model = (ToMModel, {"res_out_dim": 8, "num_agents": 2, "belief_dim": 1, "activation": "relu", "model_arch_args": {"fc_layer": 1, "out_dim_fc_0": }})
     model = (
         ToMModel,
@@ -204,7 +383,7 @@ if __name__ == "__main__":
             "fcnet_activation": "relu",
             "alpha": 0.5,
             "beta": 0.25,
-            "gamma": 0.25
+            "gamma": 0.25,
         },
     )
     print(model)
@@ -212,6 +391,8 @@ if __name__ == "__main__":
         env,
         model,
         num_gpus=0,
+        num_workers=1,
+        local_mode=True,
         stop={"timesteps_total": 10000000},
         checkpoint_freq=100,
         share_policy="group",

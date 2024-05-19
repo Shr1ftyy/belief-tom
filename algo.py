@@ -6,86 +6,93 @@ Add new algorithm to marllib - with custom policy architecture
 # import os
 import threading
 import time
-from typing import List, Union
-import torch
+from typing import Dict, List, Union
 
-import ray
 from ray.rllib.utils import force_list, NullContextManager
-import torch.nn.functional as F
 from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.utils import merge_dicts
-from ray.rllib.agents.trainer_template import build_trainer
-from ray.rllib.policy.policy_template import build_policy_class
+
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.models import ModelCatalog
-from ray.rllib.utils.typing import TrainerConfigDict
-from ray.rllib.evaluation.worker_set import WorkerSet
-from ray.util.iter import LocalIterator
-from ray.rllib.execution.rollout_ops import (
-    ParallelRollouts,
-    ConcatBatches,
-    StandardizeFields,
-    SelectExperiences,
-)
-from ray.rllib.execution.train_ops import TrainOneStep, MultiGPUTrainOneStep
-from ray.rllib.execution.metric_ops import StandardMetricsReporting
-from ray.rllib.agents.ppo.ppo import UpdateKL, warn_about_bad_reward_scales
+
 from ray.rllib.utils.typing import ModelGradients
 from ray.rllib.policy.rnn_sequencing import pad_batch_to_sequences_of_same_size
 from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
 from ray.rllib.utils.framework import try_import_torch
-from ray.rllib.agents.ppo.ppo import PPOTrainer, DEFAULT_CONFIG as PPO_CONFIG
+from ray.rllib.agents.ppo.ppo import DEFAULT_CONFIG as PPO_CONFIG
+from marllib.marl.algos.utils.centralized_critic import (
+    centralized_critic_postprocessing,
+)
 
+from ray.rllib.policy import Policy
 
 from marllib.marl.algos.core.CC.mappo import (
     MAPPOTorchPolicy,
     MAPPOTrainer,
-    get_policy_class_mappo,
     central_critic_ppo_loss,
 )
-from marllib.marl.algos.utils.centralized_critic import (
-    CentralizedValueMixin,
-    centralized_critic_postprocessing,
-)
+
+# from marllib.marl.algos.utils.centralized_critic import (
+#     CentralizedValueMixin,
+#     centralized_critic_postprocessing,
+# )
 from marllib.marl.algos.utils.setup_utils import AlgVar
 
 from marllib import marl
 import json
 from model import ToMModel
+import numpy as np
 
 torch, nn = try_import_torch()
 
 # TODO: is there a cleaner way to do this?
 TOMAPPO_CONFIG = PPO_CONFIG
-TOMAPPO_CONFIG['model']['fcnet_activation'] = 'relu'
+TOMAPPO_CONFIG["model"]["fcnet_activation"] = "relu"
+
 
 # Variational loss L_q
 def L_q(b, z, variational_net):
     q_z_given_b = variational_net(b)
-    log_q_z_given_b = -nn.functional.mse_loss(q_z_given_b, z, reduction='none')
+    log_q_z_given_b = -nn.functional.mse_loss(q_z_given_b, z, reduction="none")
     return -log_q_z_given_b.mean()
+
 
 # Residual loss L_residual
 def L_residual(b, z, variational_net):
     joint_log_prob = torch.log(variational_net(b) + 1e-8).mean()
-    marginal_b_log_prob = torch.log(variational_net(b).mean(0, keepdim=True) + 1e-8).mean()
+    marginal_b_log_prob = torch.log(
+        variational_net(b).mean(0, keepdim=True) + 1e-8
+    ).mean()
     marginal_z_log_prob = torch.log(z.mean(0, keepdim=True) + 1e-8).mean()
-    
+
     loss_residual = joint_log_prob - (marginal_b_log_prob + marginal_z_log_prob)
     return loss_residual
 
+
 def tom_policy_loss(policy, model, dist_class, train_batch):
     ppo_loss = central_critic_ppo_loss(policy, model, dist_class, train_batch)
+    # try:
+    #     # TODO: why is this empty even though the preprocess function returns actual values
+    #     # also how the heck does the learn loaded on batch function or whatever work?
+    #     if train_batch["other_agents_rewards"].shape[0] > 0:
+    #         print("")
+    # except: # noqa
+    #     pass
     # TODO (IMMEDIATE): figure out how to do grad update on belief network with belief loss
     # belief_loss = F.mse_loss(model.get_beliefs(), train_batch["rewards"])  # TODO: belief loss
-    belief_loss = 0
+    # interesting, never knew torch.tensor (small t) was a thing (???) lol
+    belief_loss = torch.tensor(0.0, requires_grad=True)
     # TODO: are the residual loss and variational loss define correctly?
-    # NOTE: below I assume that beliefs, residuals, etc, have already been generated after ppo_loss() 
+    # NOTE: below I assume that beliefs, residuals, etc, have already been generated after ppo_loss()
     # initiates a forward pass through the networks, otherwise we should do some forward passes again
     # for each network we're obtaining losses for
-    residual_loss = L_residual(model.get_beliefs(), model.get_residual(), model.variational_net)
-    variational_loss = L_q(model.get_beliefs(), model.get_residual(), model.variational_net)
+    residual_loss = L_residual(
+        model.get_beliefs(), model.get_residual(), model.variational_net
+    )
+    variational_loss = L_q(
+        model.get_beliefs(), model.get_residual(), model.variational_net
+    )
     # residual_loss = 0
     total_loss = (
         policy.config["model"]["custom_model_config"]["alpha"] * ppo_loss
@@ -93,9 +100,108 @@ def tom_policy_loss(policy, model, dist_class, train_batch):
         + policy.config["model"]["custom_model_config"]["gamma"] * residual_loss
     )
 
-    # TODO (IMMEDIATE): look at claude suggestion and apply it :)
-    # return total_loss, belief_loss, residual_loss, variational_loss
-    return total_loss
+    # TODO: should we be taking a mean?
+    num_agents = model.custom_config["num_agents"]
+    mean_residual_loss = residual_loss / num_agents
+    mean_belief_loss = belief_loss / num_agents
+    mean_variational_loss = variational_loss / num_agents
+
+    model.tower_stats["mean_residual_loss"] = mean_residual_loss
+    model.tower_stats["mean_belief_loss"] = mean_belief_loss
+    model.tower_stats["mean_variational_loss"] = mean_variational_loss
+
+    # TODO: what losses should be returned here? All three, or just one? Should we use custom_loss()???
+    return total_loss, belief_loss, variational_loss
+    # return total_loss
+
+
+def tommappo_stats(
+    policy: Policy, train_batch: SampleBatch
+) -> Dict[str, torch.TensorType]:  # type: ignore
+    """Stats function for our custom policy. Returns a dict with important KL and loss stats.
+
+    Args:
+        policy (Policy): The Policy to generate stats for.
+        train_batch (SampleBatch): The SampleBatch (already) used for training.
+
+    Returns:
+        Dict[str, TensorType]: The stats dict.
+    """
+    return {
+        "cur_kl_coeff": policy.kl_coeff,
+        "cur_lr": policy.cur_lr,
+        "total_loss": torch.mean(torch.stack(policy.get_tower_stats("total_loss"))),
+        "policy_loss": torch.mean(
+            torch.stack(policy.get_tower_stats("mean_policy_loss"))
+        ),
+        "vf_loss": torch.mean(torch.stack(policy.get_tower_stats("mean_vf_loss"))),
+        "vf_explained_var": torch.mean(
+            torch.stack(policy.get_tower_stats("vf_explained_var"))
+        ),
+        "kl": torch.mean(torch.stack(policy.get_tower_stats("mean_kl_loss"))),
+        "entropy": torch.mean(torch.stack(policy.get_tower_stats("mean_entropy"))),
+        "entropy_coeff": policy.entropy_coeff,
+        "residual_loss": torch.mean(
+            torch.stack(policy.get_tower_stats("mean_residual_loss"))
+        ),
+        "belief_loss": torch.mean(
+            torch.stack(policy.get_tower_stats("mean_belief_loss"))
+        ),
+        "variational_loss": torch.mean(
+            torch.stack(policy.get_tower_stats("mean_variational_loss"))
+        ),
+    }
+
+
+def tomappo_preprocessing(policy, sample_batch, other_agent_batches=None, episode=None):
+    train_batch = centralized_critic_postprocessing(
+        policy=policy,
+        sample_batch=sample_batch,
+        other_agent_batches=other_agent_batches,
+        episode=episode,
+    )
+
+    custom_config = policy.config["model"]["custom_model_config"]
+    opp_action_in_cc = custom_config["opp_action_in_cc"]
+    global_state_flag = custom_config["global_state_flag"]
+
+    opponent_batch = None
+
+    if (not opp_action_in_cc and global_state_flag) or other_agent_batches is None:
+        pass
+    else:
+        # need other agent batches
+        n_agents = custom_config["num_agents"]
+
+        opponent_agents_num = n_agents - 1
+        opponent_batch_list = list(other_agent_batches.values())
+        raw_opponent_batch = [
+            opponent_batch_list[i][1] for i in range(opponent_agents_num)
+        ]
+        opponent_batch = []
+        for one_opponent_batch in raw_opponent_batch:
+            if len(one_opponent_batch) == len(sample_batch):
+                pass
+            else:
+                if len(one_opponent_batch) > len(sample_batch):
+                    one_opponent_batch = one_opponent_batch.slice(0, len(sample_batch))
+                else:  # len(one_opponent_batch) < len(sample_batch):
+                    length_dif = len(sample_batch) - len(one_opponent_batch)
+                    one_opponent_batch = one_opponent_batch.concat(
+                        one_opponent_batch.slice(
+                            len(one_opponent_batch) - length_dif,
+                            len(one_opponent_batch),
+                        )
+                    )
+            opponent_batch.append(one_opponent_batch)
+
+    # train_batch["kj"]
+    if opponent_batch is not None:
+        train_batch["other_agent_rewards"] = np.array([b["rewards"] for b in opponent_batch])
+    else:
+        train_batch["other_agent_rewards"] = None
+
+    return train_batch
 
 
 def run_tommappo(model_class, config_dict, common_config, env_dict, stop, restore):
@@ -181,10 +287,14 @@ def custom_multi_gpu_parallel_grad_calc(self, sample_batches):
     def _worker(shard_idx, model, sample_batch, device):
         torch.set_grad_enabled(grad_enabled)
         try:
-            with NullContextManager(
-            ) if device.type == "cpu" else torch.cuda.device(device):
+            with (
+                NullContextManager()
+                if device.type == "cpu"
+                else torch.cuda.device(device)
+            ):
                 loss_out = force_list(
-                    self._loss(self, model, self.dist_class, sample_batch))
+                    self._loss(self, model, self.dist_class, sample_batch)
+                )
 
                 # Call Model's custom-loss with Policy loss outputs and
                 # train_batch.
@@ -202,13 +312,11 @@ def custom_multi_gpu_parallel_grad_calc(self, sample_batches):
                     # optimizer would affect.
                     param_indices = self.multi_gpu_param_groups[opt_idx]
                     for param_idx, param in enumerate(parameters):
-                        if param_idx in param_indices and \
-                                param.grad is not None:
+                        if param_idx in param_indices and param.grad is not None:
                             param.grad.data.zero_()
                     # Recompute gradients of loss over all variables.
                     loss_out[opt_idx].backward(retain_graph=True)
-                    grad_info.update(
-                        self.extra_grad_process(opt, loss_out[opt_idx]))
+                    grad_info.update(self.extra_grad_process(opt, loss_out[opt_idx]))
 
                     grads = []
                     # Note that return values are just references;
@@ -226,33 +334,39 @@ def custom_multi_gpu_parallel_grad_calc(self, sample_batches):
                             # CUDA yet.
                             for g in grads:
                                 torch.distributed.all_reduce(
-                                    g, op=torch.distributed.ReduceOp.SUM)
+                                    g, op=torch.distributed.ReduceOp.SUM
+                                )
                         else:
                             torch.distributed.all_reduce_coalesced(
-                                grads, op=torch.distributed.ReduceOp.SUM)
+                                grads, op=torch.distributed.ReduceOp.SUM
+                            )
 
                         for param_group in opt.param_groups:
                             for p in param_group["params"]:
                                 if p.grad is not None:
                                     p.grad /= self.distributed_world_size
 
-                        grad_info[
-                            "allreduce_latency"] += time.time() - start
+                        grad_info["allreduce_latency"] += time.time() - start
 
             with lock:
                 results[shard_idx] = (all_grads, grad_info)
         except Exception as e:
             with lock:
-                results[shard_idx] = (ValueError(
-                    e.args[0] + "\n" +
-                    "In tower {} on device {}".format(shard_idx, device)),
-                                        e)
+                results[shard_idx] = (
+                    ValueError(
+                        e.args[0]
+                        + "\n"
+                        + "In tower {} on device {}".format(shard_idx, device)
+                    ),
+                    e,
+                )
 
     # Single device (GPU) or fake-GPU case (serialize for better
     # debugging).
     if len(self.devices) == 1 or self.config["_fake_gpus"]:
         for shard_idx, (model, sample_batch, device) in enumerate(
-                zip(self.model_gpu_towers, sample_batches, self.devices)):
+            zip(self.model_gpu_towers, sample_batches, self.devices)
+        ):
             _worker(shard_idx, model, sample_batch, device)
             # Raise errors right away for better debugging.
             last_result = results[len(results) - 1]
@@ -262,10 +376,11 @@ def custom_multi_gpu_parallel_grad_calc(self, sample_batches):
     else:
         threads = [
             threading.Thread(
-                target=_worker,
-                args=(shard_idx, model, sample_batch, device))
+                target=_worker, args=(shard_idx, model, sample_batch, device)
+            )
             for shard_idx, (model, sample_batch, device) in enumerate(
-                zip(self.model_gpu_towers, sample_batches, self.devices))
+                zip(self.model_gpu_towers, sample_batches, self.devices)
+            )
         ]
 
         for thread in threads:
@@ -280,23 +395,42 @@ def custom_multi_gpu_parallel_grad_calc(self, sample_batches):
         if isinstance(output[0], Exception):
             raise output[0] from output[1]
         outputs.append(results[shard_idx])
-    return outputs 
+    return outputs
 
-# TODO: update this
+
+# # TODO: update this???
 def optimizer(
-        self, config
-) -> Union[List["torch.optim.Optimizer"], "torch.optim.Optimizer"]: # type: ignore
+    self, config
+) -> Union[List["torch.optim.Optimizer"], "torch.optim.Optimizer"]:  # type: ignore
     """Customizes the pytorch optimizers to be used by params
 
     Returns:
         Union[List[torch.optim.Optimizer], torch.optim.Optimizer]:
             The local PyTorch optimizer(s) to use for this Policy.
     """
-    params = filter(lambda p: p.requires_grad, self.model.parameters())
+    # params = filter(lambda p: p.requires_grad, self.model.parameters())
+    # TODO: is there a smarter way to go about this? actually, i think using the config var here somehow might do the trick!!!
+    model_params = set(self.model.parameters())
+    belief_params = set(self.model.belief_net.parameters())
+    var_params = set(self.model.variational_net.parameters())
+    optims = []
+    # TODO: is it ok to just convert to list and be off with it?
+    params = [
+        list(
+            model_params - belief_params - var_params
+        ),  # model params (excluding variational and belief net params)
+        list(belief_params),  # belief net params
+        list(var_params),  # variational net params
+    ]
     if config is not None:
-        return torch.optim.Adam(params, lr=config["lr"])
+        for p in params:
+            optims.append(torch.optim.Adam(p, lr=config["lr"]))
     else:
-        return torch.optim.Adam(params)
+        for p in params:
+            optims.append(torch.optim.Adam(p, lr=config["lr"]))
+
+    return optims
+
 
 def compute_gradients(self, postprocessed_batch: SampleBatch) -> ModelGradients:
 
@@ -319,7 +453,8 @@ def compute_gradients(self, postprocessed_batch: SampleBatch) -> ModelGradients:
     # self.model.belief_net.requires_grad = False
 
     # Do the (maybe parallelized) gradient calculation step.
-    tower_outputs = self._multi_gpu_parallel_grad_calc([postprocessed_batch])
+    # tower_outputs = self._multi_gpu_parallel_grad_calc([postprocessed_batch])
+    tower_outputs = custom_multi_gpu_parallel_grad_calc(self, [postprocessed_batch])
 
     all_grads, grad_info = tower_outputs[0]
 
@@ -339,8 +474,10 @@ def get_policy_class_tomappo(config_):
 # <class 'ray.rllib.policy.torch_policy_template.MyTorchPolicy'>
 ToMMAPPOPolicy = MAPPOTorchPolicy.with_updates(
     name="ToMMAPPOPolicy",
-    get_default_config=lambda: TOMAPPO_CONFIG, 
+    get_default_config=lambda: TOMAPPO_CONFIG,
     optimizer_fn=optimizer,
+    stats_fn=tommappo_stats,
+    postprocess_fn=tomappo_preprocessing,
     loss_fn=tom_policy_loss,
     compute_gradients_fn=compute_gradients,
 )
@@ -354,7 +491,6 @@ ToMMAPPOTrainer = MAPPOTrainer.with_updates(
 
 
 if __name__ == "__main__":
-    import ray
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -370,8 +506,6 @@ if __name__ == "__main__":
 
     tommappo = marl.algos.tommappo(hyperparam_source="common")
 
-    # model = marl.build_model(env, tommappo, {"core_arch": "mlp"})
-    # model = (ToMModel, {"res_out_dim": 8, "num_agents": 2, "belief_dim": 1, "activation": "relu", "model_arch_args": {"fc_layer": 1, "out_dim_fc_0": }})
     model = (
         ToMModel,
         {

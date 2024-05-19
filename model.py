@@ -1,23 +1,15 @@
-from typing import Any, Dict, List
-from gym.spaces import Discrete
-
-
-from ray.rllib.models.torch.fcnet import (
-    FullyConnectedNetwork as TorchFullyConnectedNetwork,
-)
-from ray.rllib.policy.sample_batch import SampleBatch
-
+# from ray.rllib.models.torch.fcnet import (
+#     FullyConnectedNetwork as TorchFullyConnectedNetwork,
+# )
 from ray.rllib.models.torch.misc import SlimFC, normc_initializer
-from marllib.marl.models.zoo.mlp.base_mlp import BaseMLP
 from marllib.marl.models.zoo.mlp.cc_mlp import CentralizedCriticMLP
 from ray.rllib.utils.framework import try_import_torch
-from ray.rllib.utils.annotations import override
-from ray.rllib.utils.typing import Dict, TensorType, List, ModelConfigDict
+from ray.rllib.utils.typing import Any, Dict, List, TensorType
 
-import marl
 import numpy as np
 
 torch, nn = try_import_torch()
+
 
 class ToMModel(CentralizedCriticMLP):
     """The policy architecture"""
@@ -61,8 +53,7 @@ class ToMModel(CentralizedCriticMLP):
 
         # actor
         self.actor_net = SlimFC(
-            in_size=self.custom_config["num_agents"]
-            * self.custom_config["belief_dim"]
+            in_size=self.custom_config["num_agents"] * self.custom_config["belief_dim"]
             + self.custom_config["res_out_dim"],
             out_size=num_outputs,
             initializer=normc_initializer(0.01),

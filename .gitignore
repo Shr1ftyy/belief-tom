@@ -1,2 +1,6 @@
+.DS_Store
+*_results*
 belief.yaml
 .vscode
+*__pycache__*
+junk

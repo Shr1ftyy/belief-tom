@@ -1,0 +1,4 @@
+env_args:
+  # map_name: "simple_adversary"
+  N: 2
+  max_cycles: 50

@@ -21,9 +21,25 @@ from ray.rllib.policy.rnn_sequencing import pad_batch_to_sequences_of_same_size
 from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.agents.ppo.ppo import DEFAULT_CONFIG as PPO_CONFIG
+from ray.rllib.agents.ppo.ppo import UpdateKL, warn_about_bad_reward_scales
 from marllib.marl.algos.utils.centralized_critic import (
     centralized_critic_postprocessing,
 )
+
+from ray.rllib.evaluation.worker_set import WorkerSet
+from ray.rllib.execution.rollout_ops import (
+    ParallelRollouts,
+    ConcatBatches,
+    StandardizeFields,
+    SelectExperiences,
+)
+from ray.rllib.execution.train_ops import TrainOneStep, MultiGPUTrainOneStep
+from ray.rllib.execution.metric_ops import StandardMetricsReporting
+
+# from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
+from ray.rllib.utils.typing import TrainerConfigDict
+from ray.util.iter import LocalIterator
+
 
 from ray.rllib.policy import Policy
 
@@ -153,6 +169,66 @@ def tommappo_stats(
     }
 
 
+def tomappo_execution_plan(
+    workers: WorkerSet, config: TrainerConfigDict
+) -> LocalIterator[dict]:
+    """Execution plan of the PPO algorithm. Defines the distributed dataflow.
+
+    Args:
+        workers (WorkerSet): The WorkerSet for training the Polic(y/ies)
+            of the Trainer.
+        config (TrainerConfigDict): The trainer's configuration dict.
+
+    Returns:
+        LocalIterator[dict]: The Policy class to use with PPOTrainer.
+            If None, use `default_policy` provided in build_trainer().
+    """
+    rollouts = ParallelRollouts(workers, mode="bulk_sync")
+
+    # Collect batches for the trainable policies.
+    rollouts = rollouts.for_each(SelectExperiences(workers.trainable_policies()))
+    # Concatenate the SampleBatches into one.
+    rollouts = rollouts.combine(
+        ConcatBatches(
+            min_batch_size=config["train_batch_size"],
+            count_steps_by=config["multiagent"]["count_steps_by"],
+        )
+    )
+    # Standardize advantages.
+    rollouts = rollouts.for_each(StandardizeFields(["advantages"]))
+    rollouts = rollouts.for_each(StandardizeFields(["other_agent_rewards"]))
+
+    # Perform one training step on the combined + standardized batch.
+    if config["simple_optimizer"]:
+        train_op = rollouts.for_each(
+            TrainOneStep(
+                workers,
+                num_sgd_iter=config["num_sgd_iter"],
+                sgd_minibatch_size=config["sgd_minibatch_size"],
+            )
+        )
+    else:
+        train_op = rollouts.for_each(
+            MultiGPUTrainOneStep(
+                workers=workers,
+                sgd_minibatch_size=config["sgd_minibatch_size"],
+                num_sgd_iter=config["num_sgd_iter"],
+                num_gpus=config["num_gpus"],
+                shuffle_sequences=config["shuffle_sequences"],
+                _fake_gpus=config["_fake_gpus"],
+                framework=config.get("framework"),
+            )
+        )
+
+    # Update KL after each round of training.
+    train_op = train_op.for_each(lambda t: t[1]).for_each(UpdateKL(workers))
+
+    # Warn about bad reward scales and return training metrics.
+    return StandardMetricsReporting(train_op, workers, config).for_each(
+        lambda result: warn_about_bad_reward_scales(config, result)
+    )
+
+
 def tomappo_preprocessing(policy, sample_batch, other_agent_batches=None, episode=None):
     train_batch = centralized_critic_postprocessing(
         policy=policy,
@@ -161,43 +237,10 @@ def tomappo_preprocessing(policy, sample_batch, other_agent_batches=None, episod
         episode=episode,
     )
 
-    custom_config = policy.config["model"]["custom_model_config"]
-    opp_action_in_cc = custom_config["opp_action_in_cc"]
-    global_state_flag = custom_config["global_state_flag"]
-
-    opponent_batch = None
-
-    if (not opp_action_in_cc and global_state_flag) or other_agent_batches is None:
-        pass
-    else:
-        # need other agent batches
-        n_agents = custom_config["num_agents"]
-
-        opponent_agents_num = n_agents - 1
-        opponent_batch_list = list(other_agent_batches.values())
-        raw_opponent_batch = [
-            opponent_batch_list[i][1] for i in range(opponent_agents_num)
-        ]
-        opponent_batch = []
-        for one_opponent_batch in raw_opponent_batch:
-            if len(one_opponent_batch) == len(sample_batch):
-                pass
-            else:
-                if len(one_opponent_batch) > len(sample_batch):
-                    one_opponent_batch = one_opponent_batch.slice(0, len(sample_batch))
-                else:  # len(one_opponent_batch) < len(sample_batch):
-                    length_dif = len(sample_batch) - len(one_opponent_batch)
-                    one_opponent_batch = one_opponent_batch.concat(
-                        one_opponent_batch.slice(
-                            len(one_opponent_batch) - length_dif,
-                            len(one_opponent_batch),
-                        )
-                    )
-            opponent_batch.append(one_opponent_batch)
-
-    # train_batch["kj"]
-    if opponent_batch is not None:
-        train_batch["other_agent_rewards"] = np.array([b["rewards"] for b in opponent_batch])
+    if other_agent_batches is not None:
+        train_batch["other_agent_rewards"] = np.array(
+            [info[1]["rewards"] for _, info in other_agent_batches.items()]
+        )
     else:
         train_batch["other_agent_rewards"] = None
 
@@ -487,6 +530,7 @@ ToMMAPPOTrainer = MAPPOTrainer.with_updates(
     name="ToMMAPPOTrainer",
     default_policy=ToMMAPPOPolicy,
     get_policy_class=get_policy_class_tomappo,
+    execution_plan=tomappo_execution_plan,
 )
 
 

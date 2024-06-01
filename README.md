@@ -23,6 +23,12 @@ cp belief.example.yaml belief.yaml
 python main.py --logging_level debug --config belief.yaml
 ``` -->
 
+## Contributing
+At the moment, this is just a partial implementation - the belief inference and training componenent as well as the reward mechanics
+for the agents need to be implemented and reworked. [This pull request](https://github.com/Shr1ftyy/belief-tom/pull/2) provides an
+overview of the progress made towards creating a full working implementation, and can be used as a guide to help complete the work
+for anyone who may choose to pick up the torch :) .
+
 ## Diagrammatic Overview
 ![overview](assets/tom-overview.png) 
 
